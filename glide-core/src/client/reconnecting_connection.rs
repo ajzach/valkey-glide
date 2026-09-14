@@ -12,7 +12,7 @@ use redis::{
 use std::fmt;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{RwLock, RwLockReadGuard};
 use std::time::Duration;
 use telemetrylib::Telemetry;
@@ -25,6 +25,10 @@ use super::{run_with_timeout, types::DEFAULT_CONNECTION_TIMEOUT};
 
 const WRITE_LOCK_ERR: &str = "Failed to acquire the write lock";
 const READ_LOCK_ERR: &str = "Failed to acquire the read lock";
+
+fn tls_generation_is_current(generation: &AtomicU64, attempt_generation: u64) -> bool {
+    generation.load(Ordering::Acquire) == attempt_generation
+}
 
 /// The reason behind the call to `reconnect()`
 #[derive(PartialEq, Eq, Debug, Clone)]
@@ -126,6 +130,9 @@ struct ConnectionBackend {
     /// Optional handle to the reloaded mTLS certificate cache for refreshing the
     /// client TLS params before reconnection.
     cert_material_handle: Option<crate::tls_reload::CertReloadHandle>,
+    /// Monotonic epoch of root-trust rotations. A reconnect may publish only if it observed the
+    /// current epoch immediately before publication.
+    tls_generation: AtomicU64,
 }
 
 /// State of the current connection. Allows the user to use a connection only when a reconnect isn't in progress or has failed.
@@ -374,6 +381,7 @@ impl ReconnectingConnection {
             client_dropped_flagged: AtomicBool::new(false),
             iam_token_handle,
             cert_material_handle,
+            tls_generation: AtomicU64::new(0),
         };
         create_connection(
             backend,
@@ -517,8 +525,10 @@ impl ReconnectingConnection {
                 // If mTLS certificate reload is configured, apply the freshest
                 // (last-known-good) client certificate/key before reconnecting so
                 // a rotated certificate is adopted on the next connection attempt.
+                let mut root_generation = None;
                 if let Some(handle) = &connection_clone.inner.backend.cert_material_handle {
-                    let params = handle.current_params().await;
+                    let (params, generation) = handle.current_params_snapshot().await;
+                    root_generation = generation;
                     let mut client = connection_clone
                         .inner
                         .backend
@@ -531,6 +541,12 @@ impl ReconnectingConnection {
                         "Updated connection TLS params with reloaded client certificate before reconnection attempt",
                     );
                 }
+
+                let tls_generation = connection_clone
+                    .inner
+                    .backend
+                    .tls_generation
+                    .load(Ordering::Acquire);
 
                 let client = if let Some(ref c) = static_client {
                     c.clone()
@@ -553,15 +569,34 @@ impl ReconnectingConnection {
                             tokio::time::sleep(sleep_duration).await;
                             continue;
                         }
-                        {
+                        let stale_connection = {
                             let mut guard = connection_clone.inner.state.lock().unwrap();
-                            log_debug("reconnect", "completed successfully");
-                            connection_clone
+                            if !tls_generation_is_current(
+                                &connection_clone.inner.backend.tls_generation,
+                                tls_generation,
+                            ) || !connection_clone
                                 .inner
                                 .backend
-                                .connection_available_signal
-                                .set();
-                            *guard = ConnectionState::Connected(connection);
+                                .cert_material_handle
+                                .as_ref()
+                                .map_or(true, |handle| handle.is_snapshot_current(root_generation))
+                            {
+                                Some(connection)
+                            } else {
+                                log_debug("reconnect", "completed successfully");
+                                connection_clone
+                                    .inner
+                                    .backend
+                                    .connection_available_signal
+                                    .set();
+                                *guard = ConnectionState::Connected(connection);
+                                None
+                            }
+                        };
+
+                        if let Some(connection) = stale_connection {
+                            connection.force_close();
+                            continue;
                         }
 
                         Telemetry::incr_total_connections(1);
@@ -577,6 +612,22 @@ impl ReconnectingConnection {
     /// a newly validated dynamic root trust chain is adopted so no established TLS session keeps
     /// using the former trust store.
     pub(super) fn force_reconnect(&self) {
+        self.inner
+            .backend
+            .tls_generation
+            .fetch_add(1, Ordering::AcqRel);
+
+        let active_connection = {
+            let guard = self.inner.state.lock().unwrap();
+            match &*guard {
+                ConnectionState::Connected(connection) => Some(connection.clone()),
+                ConnectionState::Reconnecting | ConnectionState::InitializedDisconnected => None,
+            }
+        };
+
+        if let Some(connection) = active_connection {
+            connection.force_close();
+        }
         self.reconnect(ReconnectReason::ConnectionDropped);
     }
 
@@ -679,5 +730,23 @@ impl ReconnectingConnection {
     pub(crate) fn get_username(&self) -> Option<String> {
         let client = self.inner.backend.get_backend_client();
         client.get_connection_info().redis.username.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trust_rotation_invalidates_an_in_flight_reconnect() {
+        let generation = AtomicU64::new(3);
+        assert!(tls_generation_is_current(&generation, 3));
+
+        generation.fetch_add(1, Ordering::AcqRel);
+
+        assert!(
+            !tls_generation_is_current(&generation, 3),
+            "a reconnect started before a root rotation must not publish"
+        );
     }
 }

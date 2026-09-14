@@ -340,6 +340,7 @@ pub use crate::client::CertParamsProvider;
 pub use crate::client::Client;
 pub use crate::client::GlideConnectionOptions;
 pub use crate::client::IAMTokenProvider;
+pub use crate::client::TlsParamsSnapshot;
 pub use crate::cmd::{
     cmd, fenced_cmd, pack_command, pipe, Arg, Cmd, Iter, SegmentedBytes, PHASE_QUEUED, PHASE_SENT,
     SHARED_ARG_INLINE_MAX,

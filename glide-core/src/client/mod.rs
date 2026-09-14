@@ -2873,7 +2873,7 @@ async fn create_cluster_client(
         let cluster_connection = con.clone();
         tokio::spawn(async move {
             while update_handle.wait_for_update().await {
-                cluster_connection.force_tls_reconnect();
+                cluster_connection.force_tls_reconnect().await;
             }
         });
     }

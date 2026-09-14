@@ -34,6 +34,7 @@ use logger_core::{log_debug, log_error, log_info, log_warn};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::{Notify, RwLock, watch};
@@ -308,6 +309,7 @@ impl CertReloadManager {
         CertReloadHandle {
             cached_params: Arc::clone(&self.cached_params),
             fingerprint: Arc::clone(&self.fingerprint),
+            root_generation: None,
         }
     }
 }
@@ -326,12 +328,39 @@ impl Drop for CertReloadManager {
 pub struct CertReloadHandle {
     cached_params: Arc<RwLock<redis::TlsConnParams>>,
     fingerprint: Arc<RwLock<String>>,
+    /// Present only for dynamically reloaded root stores. Reading this while
+    /// holding `cached_params`' read lock gives reconnects a coherent
+    /// parameters/generation snapshot.
+    root_generation: Option<Arc<AtomicU64>>,
 }
 
 impl CertReloadHandle {
     /// Return the freshest adopted TLS params.
     pub async fn current_params(&self) -> redis::TlsConnParams {
         self.cached_params.read().await.clone()
+    }
+
+    /// Capture the adopted TLS parameters and the root-store generation that
+    /// produced them. Root-store writers advance the generation while holding
+    /// the corresponding write lock, so this can never associate old roots
+    /// with a new generation.
+    pub async fn current_params_snapshot(&self) -> (redis::TlsConnParams, Option<u64>) {
+        let params = self.cached_params.read().await;
+        let generation = self
+            .root_generation
+            .as_ref()
+            .map(|generation| generation.load(Ordering::Acquire));
+        (params.clone(), generation)
+    }
+
+    /// Check whether a snapshot is still current without awaiting. This is used
+    /// while holding the connection publication lock.
+    pub fn is_snapshot_current(&self, generation: Option<u64>) -> bool {
+        match (&self.root_generation, generation) {
+            (Some(current), Some(snapshot)) => current.load(Ordering::Acquire) == snapshot,
+            (None, None) => true,
+            _ => false,
+        }
     }
 
     /// Return the fingerprint (hex SHA-256 of the cert chain DER) of the adopted
@@ -346,6 +375,15 @@ impl redis::CertParamsProvider for CertReloadHandle {
     async fn current_tls_params(&self) -> Option<redis::TlsConnParams> {
         Some(self.current_params().await)
     }
+
+    async fn current_tls_params_snapshot(&self) -> Option<redis::TlsParamsSnapshot> {
+        let (params, generation) = self.current_params_snapshot().await;
+        Some(redis::TlsParamsSnapshot { params, generation })
+    }
+
+    fn is_tls_params_snapshot_current(&self, generation: Option<u64>) -> bool {
+        self.is_snapshot_current(generation)
+    }
 }
 
 /// Manages a dynamically supplied custom server trust chain.
@@ -357,6 +395,7 @@ impl redis::CertParamsProvider for CertReloadHandle {
 pub struct RootCertReloadManager {
     cached_params: Arc<RwLock<redis::TlsConnParams>>,
     fingerprint: Arc<RwLock<String>>,
+    generation: Arc<AtomicU64>,
     provider: RootCertificatesProvider,
     interval_seconds: u32,
     reload_task: Option<JoinHandle<()>>,
@@ -405,6 +444,7 @@ impl RootCertReloadManager {
         Ok(Self {
             cached_params: Arc::new(RwLock::new(params)),
             fingerprint: Arc::new(RwLock::new(fingerprint)),
+            generation: Arc::new(AtomicU64::new(0)),
             provider,
             interval_seconds,
             reload_task: None,
@@ -422,6 +462,7 @@ impl RootCertReloadManager {
         let provider = self.provider.clone();
         let cached_params = Arc::clone(&self.cached_params);
         let fingerprint = Arc::clone(&self.fingerprint);
+        let generation = Arc::clone(&self.generation);
         let update_notify = Arc::clone(&self.update_notify);
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let interval_seconds = self.interval_seconds;
@@ -433,7 +474,7 @@ impl RootCertReloadManager {
             loop {
                 tokio::select! {
                     _ = timer.tick() => {
-                        Self::handle_reload(&provider, &cached_params, &fingerprint, &update_notify).await;
+                        Self::handle_reload(&provider, &cached_params, &fingerprint, &generation, &update_notify).await;
                     }
                     _ = shutdown_rx.changed() => break,
                 }
@@ -445,6 +486,7 @@ impl RootCertReloadManager {
         provider: &RootCertificatesProvider,
         cached_params: &Arc<RwLock<redis::TlsConnParams>>,
         fingerprint: &Arc<RwLock<String>>,
+        generation: &Arc<AtomicU64>,
         update_notify: &Arc<Notify>,
     ) {
         match load_root_certificates(provider.clone()).await {
@@ -456,7 +498,13 @@ impl RootCertReloadManager {
                     );
                     return;
                 }
-                *cached_params.write().await = new_params;
+                // Advance the generation while holding the parameters write lock.
+                // A reader therefore observes either the old pair or the new
+                // pair, never old roots tagged with this new generation.
+                let mut cached_params = cached_params.write().await;
+                generation.fetch_add(1, Ordering::AcqRel);
+                *cached_params = new_params;
+                drop(cached_params);
                 *fingerprint.write().await = new_fingerprint.clone();
                 log_info(
                     "TLS root certificate reload",
@@ -488,6 +536,7 @@ impl RootCertReloadManager {
         CertReloadHandle {
             cached_params: Arc::clone(&self.cached_params),
             fingerprint: Arc::clone(&self.fingerprint),
+            root_generation: Some(Arc::clone(&self.generation)),
         }
     }
 
@@ -686,6 +735,7 @@ mod tests {
             &manager.provider,
             &manager.cached_params,
             &manager.fingerprint,
+            &manager.generation,
             &manager.update_notify,
         )
         .await;
@@ -704,6 +754,7 @@ mod tests {
             &manager.provider,
             &manager.cached_params,
             &manager.fingerprint,
+            &manager.generation,
             &manager.update_notify,
         )
         .await;
@@ -711,6 +762,39 @@ mod tests {
             adopted_fingerprint,
             manager.get_handle().current_fingerprint().await
         );
+    }
+
+    #[tokio::test]
+    async fn root_snapshot_invalidates_roots_captured_before_rotation() {
+        use std::sync::Mutex as StdMutex;
+
+        let bundle = Arc::new(StdMutex::new(CERT_A.as_bytes().to_vec()));
+        let source = Arc::clone(&bundle);
+        let provider =
+            RootCertificatesProvider::new(Arc::new(move || Ok(source.lock().unwrap().clone())));
+        let manager = RootCertReloadManager::new(provider, 1).await.unwrap();
+        let handle = manager.get_handle();
+
+        let (_, old_generation) = handle.current_params_snapshot().await;
+        assert!(handle.is_snapshot_current(old_generation));
+
+        *bundle.lock().unwrap() = CERT_B.as_bytes().to_vec();
+        RootCertReloadManager::handle_reload(
+            &manager.provider,
+            &manager.cached_params,
+            &manager.fingerprint,
+            &manager.generation,
+            &manager.update_notify,
+        )
+        .await;
+
+        assert!(
+            !handle.is_snapshot_current(old_generation),
+            "a reconnect that captured the prior root store must not publish"
+        );
+        let (_, new_generation) = handle.current_params_snapshot().await;
+        assert_ne!(old_generation, new_generation);
+        assert!(handle.is_snapshot_current(new_generation));
     }
 
     #[tokio::test]

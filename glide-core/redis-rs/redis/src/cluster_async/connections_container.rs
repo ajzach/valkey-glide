@@ -229,25 +229,34 @@ impl RefreshTaskStatus {
 // - `handle`: A `JoinHandle<()>` for the asynchronous reconnection task running in the background.
 // - `status`: The current state of the refresh task.
 #[derive(Debug)]
-pub(crate) struct RefreshTaskState {
+pub(crate) struct RefreshTaskState<Connection> {
     // Handle to the background reconnection task.
     pub handle: JoinHandle<()>,
     // Current status of the refresh task.
     pub status: RefreshTaskStatus,
+    /// The node removed from the connection map while this task refreshes it.
+    /// Root-trust rotation drains and force-closes this node before aborting the
+    /// task so a clone cannot keep the former trust store alive.
+    stale_node: Option<ClusterNode<Connection>>,
 }
 
-impl RefreshTaskState {
+impl<Connection> RefreshTaskState<Connection> {
     // Creates a new `RefreshTaskState` with a `Reconnecting` status.
-    pub fn new(handle: JoinHandle<()>, notifier: RefreshTaskNotifier) -> Self {
+    pub fn new(
+        handle: JoinHandle<()>,
+        notifier: RefreshTaskNotifier,
+        stale_node: Option<ClusterNode<Connection>>,
+    ) -> Self {
         debug!("RefreshTaskState: Creating a new instance with a Reconnecting state.");
         RefreshTaskState {
             handle,
             status: RefreshTaskStatus::with_notifier(notifier),
+            stale_node,
         }
     }
 }
 
-impl Drop for RefreshTaskState {
+impl<Connection> Drop for RefreshTaskState<Connection> {
     fn drop(&mut self) {
         if let RefreshTaskStatus::Reconnecting(ref notifier) = self.status {
             debug!("RefreshTaskState: Dropped while in Reconnecting status. Notifying tasks.");
@@ -268,25 +277,36 @@ impl Drop for RefreshTaskState {
 
 // This struct is used to track the status of each address refresh state
 // TODO move this struct logic into the connection_map itself
-#[derive(Default)]
-pub(crate) struct RefreshConnectionStates {
+pub(crate) struct RefreshConnectionStates<Connection> {
     // Follow the refresh ops on the connections
-    pub(crate) refresh_address_in_progress: HashMap<String, RefreshTaskState>,
+    pub(crate) refresh_address_in_progress: HashMap<String, RefreshTaskState<Connection>>,
 }
 
-impl RefreshConnectionStates {
+impl<Connection> RefreshConnectionStates<Connection> {
     // Clears all ongoing refresh connection tasks and resets associated state tracking.
     //
     // - This method removes all entries in the `refresh_address_in_progress` map.
     // - The `Drop` trait is responsible for notifying the associated notifiers and aborting any unfinished refresh tasks.
-    pub(crate) fn clear_refresh_state(&mut self) {
+    pub(crate) fn clear_refresh_state(&mut self) -> Vec<ClusterNode<Connection>> {
         debug!(
             "clear_refresh_state: removing all in-progress refresh connection tasks for addresses: {:?}",
             self.refresh_address_in_progress.keys()
         );
 
-        // Clear the entire map; Drop handles the cleanup
-        self.refresh_address_in_progress.clear();
+        // Draining lets callers force-close nodes a task had already removed
+        // from the map before Drop aborts the task.
+        self.refresh_address_in_progress
+            .drain()
+            .filter_map(|(_, mut state)| state.stale_node.take())
+            .collect()
+    }
+}
+
+impl<Connection> Default for RefreshConnectionStates<Connection> {
+    fn default() -> Self {
+        Self {
+            refresh_address_in_progress: HashMap::new(),
+        }
     }
 }
 
@@ -295,7 +315,7 @@ pub(crate) struct ConnectionsContainer<Connection> {
     pub(crate) slot_map: SlotMap,
     read_from_replica_strategy: ReadFromReplicaStrategy,
     topology_hash: TopologyHash,
-    pub(crate) refresh_conn_state: RefreshConnectionStates,
+    pub(crate) refresh_conn_state: RefreshConnectionStates<Connection>,
 }
 
 impl<Connection> Drop for ConnectionsContainer<Connection> {

@@ -132,6 +132,34 @@ pub trait CertParamsProvider: Send + Sync {
     /// Returns the current (last-known-good) TLS connection parameters, or `None`
     /// if no reloaded material is available.
     async fn current_tls_params(&self) -> Option<crate::tls::TlsConnParams>;
+
+    /// Returns TLS parameters together with the generation of the dynamic trust
+    /// store that produced them. Providers that do not rotate server trust use
+    /// the default, generation-less snapshot.
+    async fn current_tls_params_snapshot(&self) -> Option<TlsParamsSnapshot> {
+        self.current_tls_params()
+            .await
+            .map(|params| TlsParamsSnapshot {
+                params,
+                generation: None,
+            })
+    }
+
+    /// Returns whether a previously captured dynamic-trust generation is still
+    /// current. The default accepts only generation-less mTLS snapshots; a
+    /// provider that supplies a generation must also implement this check.
+    fn is_tls_params_snapshot_current(&self, generation: Option<u64>) -> bool {
+        generation.is_none()
+    }
+}
+
+/// TLS parameters captured from a provider as one reconnect snapshot.
+#[derive(Clone)]
+pub struct TlsParamsSnapshot {
+    /// TLS parameters to use for this connection attempt.
+    pub params: crate::tls::TlsConnParams,
+    /// Dynamic-root generation paired with `params`, when the provider has one.
+    pub generation: Option<u64>,
 }
 
 /// To enable async support you need to enable the feature: `tokio-comp`

@@ -62,7 +62,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::{
-        atomic::{self, AtomicIsize, AtomicUsize, Ordering},
+        atomic::{self, AtomicIsize, AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
     task::{self, Poll},
@@ -118,7 +118,7 @@ use tokio::sync::{
 // tracing macros replaced by logger_core lazy macros
 
 use self::{
-    connections_container::{ConnectionAndAddress, ConnectionType, ConnectionsMap},
+    connections_container::{ClusterNode, ConnectionAndAddress, ConnectionType, ConnectionsMap},
     connections_logic::connect_and_check,
 };
 use crate::types::RetryMethod;
@@ -475,28 +475,52 @@ where
     /// This is intentionally disruptive: callers use it only after a custom trust chain has been
     /// validated and replaced, ensuring no already-established TLS session survives that update.
     #[doc(hidden)]
-    pub fn force_tls_reconnect(&self) {
+    pub async fn force_tls_reconnect(&self) {
         let inner = self.inner_core.clone();
-        tokio::spawn(async move {
-            ClusterConnInner::refresh_cert_params_in_cluster_params(&inner).await;
-            let addresses: HashSet<String> = inner
-                .conn_lock
-                .read()
-                .all_node_connections()
-                .map(|(address, _)| address.to_string())
+        // Topology refresh is another publisher of cluster connections. Serialize
+        // the generation advance and map sweep with it so it cannot replace the
+        // freshly invalidated map with connections built from the prior roots.
+        let (addresses, stale_nodes) = {
+            let _topology_guard = inner.topology_refresh_lock.lock().await;
+            inner.tls_generation.fetch_add(1, Ordering::AcqRel);
+            let _ = ClusterConnInner::refresh_cert_params_in_cluster_params(&inner).await;
+
+            let mut connections = inner.conn_lock.write();
+            let mut addresses: HashSet<String> = connections
+                .slot_map
+                .all_node_addresses()
+                .into_iter()
+                .map(|address| address.to_string())
                 .collect();
-            if addresses.is_empty() {
-                ClusterConnInner::reconnect_to_initial_nodes(inner).await;
-            } else {
-                ClusterConnInner::trigger_refresh_connection_tasks(
-                    inner,
-                    addresses,
-                    RefreshConnectionType::AllConnections,
-                    false,
-                )
-                .await;
-            }
-        });
+            addresses.extend(
+                connections
+                    .all_node_connections()
+                    .map(|(address, _)| address.to_string()),
+            );
+            let mut stale_nodes = connections
+                .connection_map()
+                .iter()
+                .map(|entry| entry.value().clone())
+                .collect::<Vec<_>>();
+            stale_nodes.extend(connections.refresh_conn_state.clear_refresh_state());
+            (addresses, stale_nodes)
+        };
+
+        for node in stale_nodes {
+            ClusterConnInner::force_close_node(node).await;
+        }
+
+        if addresses.is_empty() {
+            ClusterConnInner::reconnect_to_initial_nodes(inner).await;
+        } else {
+            ClusterConnInner::trigger_refresh_connection_tasks(
+                inner,
+                addresses,
+                RefreshConnectionType::AllConnections,
+                false,
+            )
+            .await;
+        }
     }
 
     /// Get the username used to authenticate with all cluster servers
@@ -588,6 +612,8 @@ pub(crate) struct InnerCore<C> {
     slot_refresh_state: SlotRefreshState,
     initial_nodes: Vec<ConnectionInfo>,
     glide_connection_options: GlideConnectionOptions,
+    /// Generation of the currently accepted dynamic root trust store.
+    tls_generation: AtomicU64,
     /// Lock to ensure mutual exclusion between topology refresh operations and connection validation.
     ///
     /// This prevents validation from removing connections that were just created
@@ -1188,6 +1214,7 @@ mod iam_token_refresh_tests {
             ),
             initial_nodes: Vec::new(),
             glide_connection_options: options_with_provider(provider),
+            tls_generation: AtomicU64::new(0),
             topology_refresh_lock: tokio::sync::Mutex::new(()),
         })
     }
@@ -1648,6 +1675,7 @@ where
             slot_refresh_state: SlotRefreshState::new(slots_refresh_rate_limiter),
             initial_nodes: initial_nodes.to_vec(),
             glide_connection_options,
+            tls_generation: AtomicU64::new(0),
             topology_refresh_lock: tokio::sync::Mutex::new(()),
         });
         let mut connection = ClusterConnInner {
@@ -1831,13 +1859,32 @@ where
     /// `cluster_params` so that any subsequent connection attempts use the freshest
     /// (last-known-good) certificate/key. Mirrors
     /// [`Self::refresh_iam_token_in_cluster_params`] for the cert-rotation case.
-    async fn refresh_cert_params_in_cluster_params(inner: &Arc<InnerCore<C>>) {
+    async fn refresh_cert_params_in_cluster_params(inner: &Arc<InnerCore<C>>) -> Option<u64> {
         if let Some(ref cert_provider) = inner.glide_connection_options.cert_params_provider {
-            if let Some(params) = cert_provider.current_tls_params().await {
+            if let Some(snapshot) = cert_provider.current_tls_params_snapshot().await {
                 inner.set_cluster_param(|cluster_params| {
-                    cluster_params.tls_params = Some(params);
+                    cluster_params.tls_params = Some(snapshot.params);
                 });
+                return snapshot.generation;
             }
+        }
+        None
+    }
+
+    fn tls_snapshot_is_current(inner: &InnerCore<C>, generation: Option<u64>) -> bool {
+        inner
+            .glide_connection_options
+            .cert_params_provider
+            .as_ref()
+            .map_or(generation.is_none(), |provider| {
+                provider.is_tls_params_snapshot_current(generation)
+            })
+    }
+
+    async fn force_close_node(node: ClusterNode<ConnectionFuture<C>>) {
+        node.user_connection.conn.clone().await.force_close();
+        if let Some(connection) = &node.management_connection {
+            connection.conn.clone().await.force_close();
         }
     }
 
@@ -1848,7 +1895,8 @@ where
         let inner = inner.clone();
         Box::pin(async move {
             Self::refresh_iam_token_in_cluster_params(&inner).await;
-            Self::refresh_cert_params_in_cluster_params(&inner).await;
+            let tls_snapshot_generation = Self::refresh_cert_params_in_cluster_params(&inner).await;
+            let tls_generation = inner.tls_generation.load(Ordering::Acquire);
             let cluster_params = inner.get_cluster_param(|params| params.clone());
             let connection_map = match Self::create_initial_connections(
                 &inner.initial_nodes,
@@ -1866,10 +1914,30 @@ where
                     return;
                 }
             };
-            inner
-                .conn_lock
-                .write()
-                .extend_connection_map(connection_map);
+            let (stale, stale_nodes) = {
+                let mut connections = inner.conn_lock.write();
+                if inner.tls_generation.load(Ordering::Acquire) != tls_generation
+                    || !Self::tls_snapshot_is_current(&inner, tls_snapshot_generation)
+                {
+                    (
+                        true,
+                        connection_map
+                            .0
+                            .iter()
+                            .map(|node| node.value().clone())
+                            .collect::<Vec<_>>(),
+                    )
+                } else {
+                    connections.extend_connection_map(connection_map);
+                    (false, Vec::new())
+                }
+            };
+            if stale {
+                for node in stale_nodes {
+                    Self::force_close_node(node).await;
+                }
+                return;
+            }
             if let Err(err) = Self::refresh_slots_and_subscriptions_with_retries(
                 inner.clone(),
                 &RefreshPolicy::NotThrottable,
@@ -2030,11 +2098,12 @@ where
             let inner_clone = inner.clone();
             let address_clone_for_task = address.clone();
 
-            let mut node_option = inner.conn_lock.read().remove_node(&address);
-
-            if !check_existing_conn {
-                node_option = None;
-            }
+            let stale_node = inner.conn_lock.read().remove_node(&address);
+            let node_option = if check_existing_conn {
+                stale_node.clone()
+            } else {
+                None
+            };
 
             let handle = tokio::spawn(async move {
                 log_info_rate_limited!(
@@ -2058,11 +2127,15 @@ where
                     "No attempts performed",
                 )));
                 let mut first_attempt = true;
+                let mut tls_generation = 0;
+                let mut tls_snapshot_generation = None;
                 for backoff_duration in infinite_backoff_iter {
                     Self::refresh_iam_token_in_cluster_params(&inner_clone).await;
-                    Self::refresh_cert_params_in_cluster_params(&inner_clone).await;
+                    tls_snapshot_generation =
+                        Self::refresh_cert_params_in_cluster_params(&inner_clone).await;
 
                     let cluster_params = inner_clone.get_cluster_param(|params| params.clone());
+                    tls_generation = inner_clone.tls_generation.load(Ordering::Acquire);
 
                     node_result = get_or_create_conn(
                         &address_clone_for_task,
@@ -2074,8 +2147,22 @@ where
                     .await;
 
                     match node_result {
-                        Ok(_) => {
+                        Ok(_)
+                            if inner_clone.tls_generation.load(Ordering::Acquire)
+                                == tls_generation
+                                && Self::tls_snapshot_is_current(
+                                    &inner_clone,
+                                    tls_snapshot_generation,
+                                ) =>
+                        {
                             break;
+                        }
+                        Ok(ref node) => {
+                            Self::force_close_node(node.clone()).await;
+                            node_result = Err(RedisError::from((
+                                ErrorKind::IoError,
+                                "Discarded stale TLS connection refresh",
+                            )));
                         }
                         Err(ref err) => {
                             if first_attempt {
@@ -2100,18 +2187,35 @@ where
 
                 match node_result {
                     Ok(node) => {
-                        log_info_rate_limited!(
-                            "cluster",
-                            10,
-                            format!(
-                                "Succeeded to refresh connection for node {}.",
-                                address_clone_for_task
-                            )
-                        );
-                        inner_clone
-                            .conn_lock
-                            .read()
-                            .replace_or_add_connection_for_address(&address_clone_for_task, node);
+                        let stale = {
+                            let connections = inner_clone.conn_lock.read();
+                            if inner_clone.tls_generation.load(Ordering::Acquire) != tls_generation
+                                || !Self::tls_snapshot_is_current(
+                                    &inner_clone,
+                                    tls_snapshot_generation,
+                                )
+                            {
+                                true
+                            } else {
+                                connections.replace_or_add_connection_for_address(
+                                    &address_clone_for_task,
+                                    node.clone(),
+                                );
+                                false
+                            }
+                        };
+                        if stale {
+                            Self::force_close_node(node).await;
+                        } else {
+                            log_info_rate_limited!(
+                                "cluster",
+                                10,
+                                format!(
+                                    "Succeeded to refresh connection for node {}.",
+                                    address_clone_for_task
+                                )
+                            );
+                        }
                     }
                     Err(err) => {
                         log_warn_lazy!(
@@ -2144,7 +2248,7 @@ where
             notifiers.push(notifier.get_notifier());
 
             // Keep the task handle and notifier into the RefreshState of this address
-            let refresh_task_state = RefreshTaskState::new(handle, notifier);
+            let refresh_task_state = RefreshTaskState::new(handle, notifier, stale_node);
 
             inner
                 .conn_lock
@@ -2784,7 +2888,8 @@ where
 
         // Ensure cluster_params has a fresh IAM token and reloaded cert before creating connections
         Self::refresh_iam_token_in_cluster_params(&inner).await;
-        Self::refresh_cert_params_in_cluster_params(&inner).await;
+        let tls_snapshot_generation = Self::refresh_cert_params_in_cluster_params(&inner).await;
+        let tls_generation = inner.tls_generation.load(Ordering::Acquire);
         let cluster_params = inner.get_cluster_param(|params| params.clone());
         let glide_connection_options = &inner.glide_connection_options;
 
@@ -2879,12 +2984,28 @@ where
         // then carry over any IPs from the previous slot map that weren't re-resolved.
         new_slots.populate_ips(resolved_ips);
 
-        // Reset the current slot map and connection vector with the new ones
+        // Reset the current slot map and connection vector with the new ones.
+        // Both the root-provider snapshot and the local rotation generation
+        // must remain current until this publication point.
         let mut write_guard = inner.conn_lock.write();
+        if inner.tls_generation.load(Ordering::Acquire) != tls_generation
+            || !Self::tls_snapshot_is_current(&inner, tls_snapshot_generation)
+        {
+            let stale_nodes = new_connections
+                .0
+                .iter()
+                .map(|node| node.value().clone())
+                .collect::<Vec<_>>();
+            drop(write_guard);
+            for node in stale_nodes {
+                Self::force_close_node(node).await;
+            }
+            return Ok(());
+        }
         let old_topology_hash = write_guard.get_current_topology_hash();
         // Clear the refresh tasks of the prev instance
         // TODO - Maybe we can take the running refresh tasks and use them instead of running new connection creation
-        write_guard.refresh_conn_state.clear_refresh_state();
+        let _ = write_guard.refresh_conn_state.clear_refresh_state();
         new_slots.carry_over_ips_from(&write_guard.slot_map);
         let read_from_replicas =
             inner.get_cluster_param(|params| params.read_from_replicas.clone());

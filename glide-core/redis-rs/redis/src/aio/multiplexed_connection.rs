@@ -12,7 +12,7 @@ use crate::types::{RedisError, RedisFuture, RedisResult, Value};
 use crate::{cmd, ConnectionInfo, ProtocolVersion, PushKind};
 use ::tokio::{
     io::{AsyncRead, AsyncWrite},
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, watch},
 };
 use arc_swap::ArcSwap;
 use futures_util::{
@@ -263,6 +263,7 @@ pub(crate) struct Pipeline<SinkItem> {
     sender: mpsc::Sender<PipelineMessage<SinkItem>>,
     push_manager: Arc<ArcSwap<PushManager>>,
     is_stream_closed: Arc<AtomicBool>,
+    shutdown_tx: watch::Sender<()>,
     /// Monotonic liveness counter bumped by the writer task on each unit of
     /// progress: when it drains a message from the channel into the sink (a freed
     /// slot, in `start_send`) and when it receives a server response (in
@@ -777,6 +778,7 @@ where
         let push_manager: Arc<ArcSwap<PushManager>> =
             Arc::new(ArcSwap::new(Arc::new(PushManager::default())));
         let is_stream_closed = Arc::new(AtomicBool::new(false));
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(());
         let progress = Arc::new(AtomicU64::new(0));
         let sink = PipelineSink::new::<SinkItem>(
             sink_stream,
@@ -790,15 +792,27 @@ where
             .map(Ok)
             .forward(sink)
             .map(|_| ());
+        let driver = async move {
+            tokio::select! {
+                _ = f => {}
+                _ = shutdown_rx.changed() => {}
+            }
+        };
         (
             Pipeline {
                 sender,
                 push_manager,
                 is_stream_closed,
+                shutdown_tx,
                 progress,
             },
-            f,
+            driver,
         )
+    }
+
+    fn force_close(&self) {
+        self.is_stream_closed.store(true, Ordering::Release);
+        self.shutdown_tx.send_replace(());
     }
 
     // `None` means that the stream was out of items causing that poll loop to shut down.
@@ -823,6 +837,13 @@ where
         is_fenced: bool,
         is_blocking: bool,
     ) -> Result<Value, RedisError> {
+        if self.is_stream_closed.load(Ordering::Acquire) {
+            return Err(RedisError::from((
+                crate::ErrorKind::FatalSendError,
+                "Failed to send the request to the server",
+                "the pipeline writer task has terminated".to_string(),
+            )));
+        }
         let (sender, receiver) = oneshot::channel();
 
         // Acquire a slot in the bounded pipeline channel, distinguishing a
@@ -990,6 +1011,11 @@ impl Debug for MultiplexedConnection {
 }
 
 impl MultiplexedConnection {
+    /// Immediately closes the shared pipeline and the underlying transport for every clone.
+    pub fn force_close(&self) {
+        self.pipeline.force_close();
+    }
+
     /// Constructs a new `MultiplexedConnection` out of a `AsyncRead + AsyncWrite` object
     /// and a `ConnectionInfo`
     pub async fn new<C>(
@@ -1361,6 +1387,10 @@ impl ConnectionLike for MultiplexedConnection {
 
     fn is_closed(&self) -> bool {
         self.pipeline.is_closed()
+    }
+
+    fn force_close(&self) {
+        MultiplexedConnection::force_close(self);
     }
 
     /// Get the node's availability zone
@@ -1855,6 +1885,38 @@ mod tests {
              the 2s request timeout. Without the fix, this hangs forever.",
             elapsed,
         );
+    }
+
+    #[tokio::test]
+    async fn force_close_invalidates_all_pipeline_clones() {
+        let stall_flag = Arc::new(AtomicBool::new(false));
+        let (sink_tx, _sink_rx) = futures_mpsc::channel(1);
+        let (_response_tx, response_rx) = futures_mpsc::channel(1);
+        let stalling_sink = StallingSink {
+            stall: stall_flag,
+            inner_tx: sink_tx,
+            inner_rx: response_rx,
+        };
+        let (pipeline, driver) = Pipeline::new(stalling_sink, None, None);
+        let driver = tokio::spawn(driver);
+        let mut cloned_pipeline = pipeline.clone();
+
+        pipeline.force_close();
+
+        assert!(pipeline.is_closed());
+        assert!(
+            cloned_pipeline
+                .send_single(
+                    crate::cmd("PING").get_packed_command(),
+                    Duration::from_secs(1),
+                    false,
+                    false,
+                )
+                .await
+                .is_err(),
+            "a forced close must fail commands sent through a cloned pipeline"
+        );
+        driver.await.unwrap();
     }
 
     /// A Sink+Stream that simulates the TCP deadlock condition:

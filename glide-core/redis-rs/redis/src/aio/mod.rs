@@ -83,6 +83,12 @@ pub trait ConnectionLike {
     /// Returns the state of the connection
     fn is_closed(&self) -> bool;
 
+    /// Immediately invalidates this transport and any clones sharing it.
+    ///
+    /// The default is a no-op because not every `ConnectionLike` owns a transport. Concrete
+    /// multiplexed connections override it so trust-store rotation can fail closed.
+    fn force_close(&self) {}
+
     /// Get the connection availibility zone
     fn get_az(&self) -> Option<String> {
         None
