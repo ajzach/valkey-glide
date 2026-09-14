@@ -60,6 +60,26 @@ async fn build_cert_material_manager(
     Ok(Some(Arc::new(manager)))
 }
 
+/// Builds the dynamic custom-root manager for server TLS. The Java binding injects the provider
+/// after decoding the protobuf request; its cadence remains serialized so the core can enforce it.
+async fn build_root_cert_material_manager(
+    connection_request: &ConnectionRequest,
+) -> Result<Option<Arc<crate::tls_reload::RootCertReloadManager>>, String> {
+    let Some(provider) = connection_request.root_certificates_provider.clone() else {
+        return Ok(None);
+    };
+    let interval_seconds = connection_request
+        .root_cert_reload_interval_seconds
+        .ok_or_else(|| {
+            "root certificates provider requires a positive reload interval".to_string()
+        })?;
+    let mut manager = crate::tls_reload::RootCertReloadManager::new(provider, interval_seconds)
+        .await
+        .map_err(|_| "initial dynamic root certificate load failed".to_string())?;
+    manager.start_reload_task();
+    Ok(Some(Arc::new(manager)))
+}
+
 #[derive(Debug)]
 enum ReadFrom {
     Primary,
@@ -95,6 +115,9 @@ struct DropWrapper {
     /// configured. Held here so the task lives for the client's lifetime and is
     /// shut down when the client is dropped.
     _cert_material_manager: Option<Arc<crate::tls_reload::CertReloadManager>>,
+    /// Owns the dynamic custom-root polling task. Its update listener forces each connection to
+    /// establish a fresh TLS session after a valid trust-chain change.
+    _root_cert_material_manager: Option<Arc<crate::tls_reload::RootCertReloadManager>>,
 }
 
 impl Drop for DropWrapper {
@@ -237,6 +260,8 @@ impl StandaloneClient {
         let has_client_key = !connection_request.client_key.is_empty();
         let has_cert_path = connection_request.client_cert_path.is_some();
         let has_key_path = connection_request.client_key_path.is_some();
+        super::validate_root_certificates_provider_config(&connection_request)
+            .map_err(|err| StandaloneClientConnectionError::FailedConnection(vec![(None, err)]))?;
         super::validate_client_cert_config(
             has_client_cert,
             has_client_key,
@@ -249,6 +274,19 @@ impl StandaloneClient {
         // cert-reload manager, built next, never sees unvalidated root material.
         let root_cert_bytes = super::combine_root_certs(&connection_request.root_certs)
             .map_err(|err| StandaloneClientConnectionError::FailedConnection(vec![(None, err)]))?;
+
+        let root_cert_material_manager = build_root_cert_material_manager(&connection_request)
+            .await
+            .map_err(|err| {
+                StandaloneClientConnectionError::FailedConnection(vec![(
+                    None,
+                    RedisError::from((
+                        redis::ErrorKind::InvalidClientConfig,
+                        "TLS root certificate reload configuration error",
+                        err,
+                    )),
+                )])
+            })?;
 
         // Build the certificate reload manager when path-based mTLS is configured.
         // It performs the initial parse + validation and, if reload is enabled,
@@ -268,8 +306,21 @@ impl StandaloneClient {
                     )])
                 })?;
         let cert_material_handle = cert_material_manager.as_ref().map(|m| m.get_handle());
+        let root_cert_material_handle = root_cert_material_manager.as_ref().map(|m| m.get_handle());
+        let dynamic_tls_handle = root_cert_material_handle.or(cert_material_handle);
 
-        let tls_params = if let Some(manager) = &cert_material_manager {
+        let tls_params = if let Some(manager) = &root_cert_material_manager {
+            if tls_mode.unwrap_or(TlsMode::NoTls) == TlsMode::NoTls {
+                return Err(StandaloneClientConnectionError::FailedConnection(vec![(
+                    None,
+                    RedisError::from((
+                        redis::ErrorKind::InvalidClientConfig,
+                        "Dynamic root certificates require TLS",
+                    )),
+                )]));
+            }
+            Some(manager.get_params().await)
+        } else if let Some(manager) = &cert_material_manager {
             // Path-based mTLS: seed the initial params from the (validated) manager.
             if tls_mode.unwrap_or(TlsMode::NoTls) == TlsMode::NoTls {
                 return Err(StandaloneClientConnectionError::FailedConnection(vec![(
@@ -327,7 +378,7 @@ impl StandaloneClient {
         let discovery_tls_params = tls_params.clone();
         let discovery_pubsub_sync = pubsub_synchronizer.clone();
         let discovery_iam_handle = iam_token_handle.clone();
-        let discovery_cert_handle = cert_material_handle.clone();
+        let discovery_cert_handle = dynamic_tls_handle.clone();
         let discovery_resolver = connection_request.address_resolver.clone();
 
         let mut stream = stream::iter(addresses)
@@ -345,7 +396,7 @@ impl StandaloneClient {
                     read_only || node_discovery_mode == NodeDiscoveryMode::Static;
                 let resolver = connection_request.address_resolver.clone();
                 let iam_handle = iam_token_handle.clone();
-                let cert_handle = cert_material_handle.clone();
+                let cert_handle = dynamic_tls_handle.clone();
                 async move {
                     get_connection_and_replication_info(
                         &address,
@@ -651,6 +702,18 @@ impl StandaloneClient {
         // Successfully created new client. Update the telemetry
         Telemetry::incr_total_clients(1);
 
+        if let Some(manager) = &root_cert_material_manager {
+            let update_handle = manager.get_update_handle();
+            let nodes_for_reload = nodes.clone();
+            tokio::spawn(async move {
+                while update_handle.wait_for_update().await {
+                    for node in &nodes_for_reload {
+                        node.force_reconnect();
+                    }
+                }
+            });
+        }
+
         Ok(Self {
             inner: Arc::new(DropWrapper {
                 primary_index,
@@ -658,6 +721,7 @@ impl StandaloneClient {
                 read_from,
                 read_only,
                 _cert_material_manager: cert_material_manager,
+                _root_cert_material_manager: root_cert_material_manager,
             }),
         })
     }

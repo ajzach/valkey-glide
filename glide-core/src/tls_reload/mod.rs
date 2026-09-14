@@ -1,6 +1,6 @@
 // Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 
-//! Automatic reloading of the mTLS client certificate and private key from disk.
+//! Automatic reloading of TLS client and root certificate material.
 //!
 //! This module mirrors the credential-rotation shape used by the IAM token
 //! manager ([`crate::iam`]): a background task re-reads the certificate and key
@@ -9,11 +9,11 @@
 //! shares the cache with the reconnection path, which applies the freshest params
 //! before every reconnect attempt (see `reconnecting_connection.rs`).
 //!
-//! Design decisions (see GitHub issue #6529):
-//! - **Client certificate/key only.** Root/CA certificate reload is out of scope
-//!   (higher blast radius, deferred deliberately, tracked in
-//!   <https://github.com/valkey-io/valkey-glide/issues/6529>). Only the leaf cert
-//!   and its key are re-read.
+//! Design decisions:
+//! - **Separate mTLS and trust-store reload paths.** [`CertReloadManager`] reloads
+//!   client certificate/key files. [`RootCertReloadManager`] polls a binding-provided
+//!   callback for the complete root/CA PEM bundle. The two modes are mutually
+//!   exclusive because a dynamic trust store currently does not support mTLS.
 //! - **Periodic re-read, no file watcher.** Re-reading on a `tokio::interval` needs
 //!   no new dependency. If a rotation is partially complete (e.g. the client
 //!   certificate has been updated but the client key has not yet), validation simply
@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::{Notify, RwLock, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval};
 
@@ -44,6 +44,36 @@ use tokio::time::{MissedTickBehavior, interval};
 const DEFAULT_RELOAD_INTERVAL_SECONDS: u32 = 300;
 /// Warn if the interval exceeds 1 hour; rotated certs may then linger too long.
 const WARNING_RELOAD_INTERVAL_SECONDS: u32 = 60 * 60;
+/// Bound a binding callback's PEM response before parsing it. A trust bundle normally contains a
+/// handful of certificates; accepting arbitrarily large callback output would let a bad provider
+/// consume unbounded native memory on every polling tick.
+const MAX_ROOT_CERTIFICATE_BUNDLE_BYTES: usize = 1024 * 1024;
+
+/// Binding-neutral callback that supplies the complete current custom root-certificate PEM bundle.
+///
+/// The callback is executed on a Tokio blocking worker. Implementations must not expose returned
+/// PEM or provider-specific error details through logs.
+#[derive(Clone)]
+pub struct RootCertificatesProvider {
+    callback: Arc<dyn Fn() -> Result<Vec<u8>, String> + Send + Sync>,
+}
+
+impl std::fmt::Debug for RootCertificatesProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RootCertificatesProvider")
+            .finish_non_exhaustive()
+    }
+}
+
+impl RootCertificatesProvider {
+    pub fn new(callback: Arc<dyn Fn() -> Result<Vec<u8>, String> + Send + Sync>) -> Self {
+        Self { callback }
+    }
+
+    fn get(&self) -> Result<Vec<u8>, String> {
+        (self.callback)()
+    }
+}
 
 /// Errors that can occur while loading or validating certificate material.
 #[derive(Debug, Error)]
@@ -69,10 +99,8 @@ pub(crate) struct ClientCertReloadState {
     key_path: PathBuf,
     interval_seconds: u32,
     /// Root/CA certificate bytes (PEM), read once at construction and re-attached
-    /// to every produced `TlsConnParams`. Root reload is out of scope, so this is
-    /// constant for the client's lifetime.
-    // TODO #6529: when root/CA reload lands, this field becomes reloadable
-    // material rather than a constant. https://github.com/valkey-io/valkey-glide/issues/6529
+    /// to every produced `TlsConnParams`. This is constant for this mTLS reload
+    /// manager; dynamic roots are handled by `RootCertReloadManager` instead.
     root_cert: Option<Vec<u8>>,
 }
 
@@ -113,9 +141,8 @@ impl CertReloadManager {
     /// # Arguments
     /// * `cert_path` - Path to the PEM client certificate (chain) file.
     /// * `key_path` - Path to the PEM client private key file.
-    /// * `root_cert` - Optional root/CA certificate bytes (PEM), attached to every
-    ///   produced params. Root reload is out of scope (tracked in
-    ///   <https://github.com/valkey-io/valkey-glide/issues/6529>); this is constant.
+    /// * `root_cert` - Optional static root/CA certificate bytes (PEM), attached to
+    ///   every produced params. Dynamic root certificates use `RootCertReloadManager`.
     /// * `interval_seconds` - Optional re-read interval. Defaults to
     ///   `DEFAULT_RELOAD_INTERVAL_SECONDS` when unset.
     pub async fn new(
@@ -321,6 +348,225 @@ impl redis::CertParamsProvider for CertReloadHandle {
     }
 }
 
+/// Manages a dynamically supplied custom server trust chain.
+///
+/// This is intentionally separate from [`CertReloadManager`]: the latter rotates mTLS client
+/// credentials read from files, while this manager owns a complete replacement root store supplied
+/// by a language binding. Both share [`CertReloadHandle`] so existing reconnect paths consume
+/// validated `TlsConnParams` without knowing where their TLS material originated.
+pub struct RootCertReloadManager {
+    cached_params: Arc<RwLock<redis::TlsConnParams>>,
+    fingerprint: Arc<RwLock<String>>,
+    provider: RootCertificatesProvider,
+    interval_seconds: u32,
+    reload_task: Option<JoinHandle<()>>,
+    update_notify: Arc<Notify>,
+    shutdown_tx: watch::Sender<()>,
+}
+
+impl std::fmt::Debug for RootCertReloadManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RootCertReloadManager")
+            .field("interval_seconds", &self.interval_seconds)
+            .field("reload_task", &self.reload_task.is_some())
+            .finish()
+    }
+}
+
+impl RootCertReloadManager {
+    /// Loads and validates the initial dynamic trust bundle. There is no fallback at startup: a
+    /// client configured with custom dynamic roots must not connect using platform roots instead.
+    pub async fn new(
+        provider: RootCertificatesProvider,
+        interval_seconds: u32,
+    ) -> Result<Self, CertReloadError> {
+        if interval_seconds == 0 {
+            return Err(CertReloadError::Invalid(
+                "root certificate reload interval must be positive".to_string(),
+            ));
+        }
+        if interval_seconds >= WARNING_RELOAD_INTERVAL_SECONDS {
+            log_warn(
+                "TLS root certificate reload interval warning",
+                format!(
+                    "Reload interval of {interval_seconds} seconds exceeds recommended maximum of \
+                     {WARNING_RELOAD_INTERVAL_SECONDS} seconds; trust-chain adoption may be delayed."
+                ),
+            );
+        }
+
+        let (params, fingerprint) = load_root_certificates(provider.clone()).await?;
+        log_info(
+            "TLS root certificate reload",
+            format!("Loaded initial trust chain (fingerprint sha256:{fingerprint})"),
+        );
+
+        let (shutdown_tx, _) = watch::channel(());
+        Ok(Self {
+            cached_params: Arc::new(RwLock::new(params)),
+            fingerprint: Arc::new(RwLock::new(fingerprint)),
+            provider,
+            interval_seconds,
+            reload_task: None,
+            update_notify: Arc::new(Notify::new()),
+            shutdown_tx,
+        })
+    }
+
+    /// Starts periodic provider polling. Idempotent.
+    pub fn start_reload_task(&mut self) {
+        if self.reload_task.is_some() {
+            return;
+        }
+
+        let provider = self.provider.clone();
+        let cached_params = Arc::clone(&self.cached_params);
+        let fingerprint = Arc::clone(&self.fingerprint);
+        let update_notify = Arc::clone(&self.update_notify);
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+        let interval_seconds = self.interval_seconds;
+        self.reload_task = Some(tokio::spawn(async move {
+            let mut timer = interval(Duration::from_secs(interval_seconds as u64));
+            timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            // Initial material was loaded synchronously by `new`.
+            timer.tick().await;
+            loop {
+                tokio::select! {
+                    _ = timer.tick() => {
+                        Self::handle_reload(&provider, &cached_params, &fingerprint, &update_notify).await;
+                    }
+                    _ = shutdown_rx.changed() => break,
+                }
+            }
+        }));
+    }
+
+    async fn handle_reload(
+        provider: &RootCertificatesProvider,
+        cached_params: &Arc<RwLock<redis::TlsConnParams>>,
+        fingerprint: &Arc<RwLock<String>>,
+        update_notify: &Arc<Notify>,
+    ) {
+        match load_root_certificates(provider.clone()).await {
+            Ok((new_params, new_fingerprint)) => {
+                if *fingerprint.read().await == new_fingerprint {
+                    log_debug(
+                        "TLS root certificate reload",
+                        "Reloaded trust chain is unchanged; keeping current material",
+                    );
+                    return;
+                }
+                *cached_params.write().await = new_params;
+                *fingerprint.write().await = new_fingerprint.clone();
+                log_info(
+                    "TLS root certificate reload",
+                    format!(
+                        "Adopted rotated trust chain (fingerprint sha256:{new_fingerprint}); reconnecting TLS sessions"
+                    ),
+                );
+                // There is one connection-owner listener per manager. `notify_one` retains a
+                // permit if it has not started waiting yet, so a valid rotation cannot be lost
+                // during client startup.
+                update_notify.notify_one();
+            }
+            Err(_) => {
+                // Provider errors can include endpoints, paths, or PEM data. Keep the error generic
+                // while preserving the last-known-good trust store.
+                log_warn(
+                    "TLS root certificate reload",
+                    "Rejected dynamic trust-chain update; keeping last-known-good trust store",
+                );
+            }
+        }
+    }
+
+    pub async fn get_params(&self) -> redis::TlsConnParams {
+        self.cached_params.read().await.clone()
+    }
+
+    pub fn get_handle(&self) -> CertReloadHandle {
+        CertReloadHandle {
+            cached_params: Arc::clone(&self.cached_params),
+            fingerprint: Arc::clone(&self.fingerprint),
+        }
+    }
+
+    pub fn get_update_handle(&self) -> RootCertReloadUpdateHandle {
+        RootCertReloadUpdateHandle {
+            update_notify: Arc::clone(&self.update_notify),
+            shutdown_rx: self.shutdown_tx.subscribe(),
+        }
+    }
+}
+
+impl Drop for RootCertReloadManager {
+    fn drop(&mut self) {
+        self.shutdown_tx.send_replace(());
+        if let Some(task) = self.reload_task.take() {
+            task.abort();
+        }
+    }
+}
+
+/// Listener handle used by connection owners to force new TLS sessions after a successful trust
+/// chain change. It contains no provider reference, avoiding a lifecycle cycle with the client.
+#[derive(Clone)]
+pub struct RootCertReloadUpdateHandle {
+    update_notify: Arc<Notify>,
+    shutdown_rx: watch::Receiver<()>,
+}
+
+impl RootCertReloadUpdateHandle {
+    /// Returns `true` when a new trust bundle was adopted, or `false` on client shutdown.
+    pub async fn wait_for_update(&self) -> bool {
+        let mut shutdown_rx = self.shutdown_rx.clone();
+        tokio::select! {
+            _ = self.update_notify.notified() => true,
+            _ = shutdown_rx.changed() => false,
+        }
+    }
+}
+
+async fn load_root_certificates(
+    provider: RootCertificatesProvider,
+) -> Result<(redis::TlsConnParams, String), CertReloadError> {
+    let pem_bundle = tokio::task::spawn_blocking(move || provider.get())
+        .await
+        .map_err(|_| {
+            CertReloadError::Invalid("root certificates provider task failed".to_string())
+        })?
+        .map_err(|_| CertReloadError::Invalid("root certificates provider failed".to_string()))?;
+
+    if pem_bundle.is_empty() {
+        return Err(CertReloadError::Invalid(
+            "root certificates provider returned an empty bundle".to_string(),
+        ));
+    }
+    if pem_bundle.len() > MAX_ROOT_CERTIFICATE_BUNDLE_BYTES {
+        return Err(CertReloadError::Invalid(
+            "root certificates provider returned an oversized bundle".to_string(),
+        ));
+    }
+
+    let fingerprint = sha256_fingerprint(&pem_bundle);
+    let params = redis::retrieve_tls_certificates(redis::TlsCertificates {
+        client_tls: None,
+        root_cert: Some(pem_bundle),
+    })
+    .map_err(|_| CertReloadError::Invalid("invalid root certificate bundle".to_string()))?;
+    Ok((params, fingerprint))
+}
+
+fn sha256_fingerprint(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write;
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
+}
+
 /// Read both files, parse them into [`redis::TlsConnParams`], validate that the
 /// key matches the leaf certificate, and compute the cert-chain fingerprint.
 ///
@@ -419,6 +665,68 @@ mod tests {
             .await
             .expect("matching pair should validate");
         assert_eq!(fp.len(), 64, "fingerprint should be hex sha256");
+    }
+
+    #[tokio::test]
+    async fn root_cert_reload_adopts_valid_bundle_and_keeps_last_known_good_on_failure() {
+        use std::sync::Mutex as StdMutex;
+
+        let bundle = Arc::new(StdMutex::new(CERT_A.as_bytes().to_vec()));
+        let source = Arc::clone(&bundle);
+        let provider =
+            RootCertificatesProvider::new(Arc::new(move || Ok(source.lock().unwrap().clone())));
+        let manager = RootCertReloadManager::new(provider, 1).await.unwrap();
+        let original_fingerprint = manager.get_handle().current_fingerprint().await;
+
+        let update_handle = manager.get_update_handle();
+        let waiter = tokio::spawn(async move { update_handle.wait_for_update().await });
+        tokio::task::yield_now().await;
+        *bundle.lock().unwrap() = CERT_B.as_bytes().to_vec();
+        RootCertReloadManager::handle_reload(
+            &manager.provider,
+            &manager.cached_params,
+            &manager.fingerprint,
+            &manager.update_notify,
+        )
+        .await;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), waiter)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+
+        let adopted_fingerprint = manager.get_handle().current_fingerprint().await;
+        assert_ne!(original_fingerprint, adopted_fingerprint);
+
+        *bundle.lock().unwrap() = b"not a PEM certificate".to_vec();
+        RootCertReloadManager::handle_reload(
+            &manager.provider,
+            &manager.cached_params,
+            &manager.fingerprint,
+            &manager.update_notify,
+        )
+        .await;
+        assert_eq!(
+            adopted_fingerprint,
+            manager.get_handle().current_fingerprint().await
+        );
+    }
+
+    #[tokio::test]
+    async fn root_cert_reload_listener_stops_when_manager_is_dropped() {
+        let provider = RootCertificatesProvider::new(Arc::new(|| Ok(CERT_A.as_bytes().to_vec())));
+        let manager = RootCertReloadManager::new(provider, 1).await.unwrap();
+        let update_handle = manager.get_update_handle();
+
+        drop(manager);
+
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(1), update_handle.wait_for_update())
+                .await
+                .unwrap(),
+            "a listener created before shutdown must observe manager drop"
+        );
     }
 
     #[tokio::test]

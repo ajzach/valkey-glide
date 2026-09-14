@@ -9,12 +9,13 @@ mod standalone_client_tests {
     use crate::constants::{IP_ADDRESS_V4, IP_ADDRESS_V6};
     use crate::utilities::mocks::{Mock, ServerMock, SetInfoResponse};
     use glide_core::{
-        client::{Client as GlideClient, ConnectionError, StandaloneClient},
+        client::{Client as GlideClient, ConnectionError, ConnectionRequest, StandaloneClient},
         connection_request::{ProtocolVersion, ReadFrom},
     };
     use redis::{FromRedisValue, Value};
     use rstest::rstest;
     use std::collections::HashMap;
+    use std::sync::Arc;
     use utilities::*;
 
     async fn get_connected_clients(client: &mut StandaloneClient) -> usize {
@@ -953,6 +954,42 @@ mod standalone_client_tests {
                 StandaloneClient::create_client(connection_request.into(), None, None, None)
                     .await
                     .expect("Failed to create client with custom root cert");
+
+            assert_connected(&mut client).await;
+        });
+    }
+
+    #[rstest]
+    #[serial_test::serial]
+    #[timeout(SHORT_STANDALONE_TEST_TIMEOUT)]
+    fn test_tls_connection_with_dynamic_root_certificates_provider() {
+        block_on_all(async move {
+            let tempdir = tempfile::tempdir().expect("Failed to create temp dir");
+            let tls_paths = build_tls_file_paths(&tempdir);
+            let ca_cert_bytes = tls_paths.read_ca_cert_as_bytes();
+            let server = RedisServer::new_with_tls(true, Some(tls_paths));
+            let server_addr = server.get_client_addr();
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+            let mut protobuf_request = create_connection_request(
+                &[server_addr],
+                &TestConfiguration {
+                    use_tls: true,
+                    shared_server: false,
+                    ..Default::default()
+                },
+            );
+            protobuf_request.tls_mode = glide_core::connection_request::TlsMode::SecureTls.into();
+            let mut request: ConnectionRequest = protobuf_request.into();
+            request.root_certificates_provider =
+                Some(glide_core::tls_reload::RootCertificatesProvider::new(
+                    Arc::new(move || Ok(ca_cert_bytes.clone())),
+                ));
+            request.root_cert_reload_interval_seconds = Some(1);
+
+            let mut client = StandaloneClient::create_client(request, None, None, None)
+                .await
+                .expect("Failed to create client with dynamic root certificates provider");
 
             assert_connected(&mut client).await;
         });

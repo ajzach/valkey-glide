@@ -149,14 +149,15 @@ message ConnectionRequest {
     optional string client_key_path = 32;
     optional ClientCertReloadConfig cert_reload = 33;
     optional uint32 recovery_requests_queue_size = 34;
+    // Polling interval for a binding-provided dynamic custom root certificate source. The provider
+    // itself is binding-local (for example a Java JNI callback), so it is not represented in proto.
+    optional uint32 root_cert_reload_interval_seconds = 35;
 }
 
 // Configuration for automatic reloading of the mTLS client certificate and key
 // from their configured file paths. Reload only takes effect when the paths are
 // provided.
 //
-// Root/CA certificate reload is out of scope (tracked in
-// https://github.com/valkey-io/valkey-glide/issues/6529).
 message ClientCertReloadConfig {
     bool enabled = 1;
     // Re-read interval in seconds. When unset, the default is defined by

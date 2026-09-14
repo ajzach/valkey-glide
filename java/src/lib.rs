@@ -33,6 +33,7 @@ mod jni_client;
 mod jni_pool;
 mod jni_scope;
 mod linked_hashmap;
+mod root_certificates_callback;
 mod routing;
 
 use errors::{FFIError, handle_errors, run_ffi};
@@ -40,6 +41,9 @@ use jni_client::*;
 
 use crate::address_resolver::JavaAddressResolver;
 use crate::iam_token_callback::{JavaIamTokenCallback, make_iam_provider_callback};
+use crate::root_certificates_callback::{
+    JavaRootCertificatesCallback, make_root_certificates_provider_callback,
+};
 /// Process command arguments for compression, matching the socket_listener pattern.
 /// Extracts args from the command, applies compression if applicable, and rebuilds the command.
 fn process_command_for_compression(
@@ -1170,6 +1174,8 @@ fn safe_create_jstring<'local>(mut env: JNIEnv<'local>, input: &str) -> JString<
 /// garbage collected while the client is alive.
 /// If iam_credentials_provider is not null, it will be stored as a global reference
 /// and invoked whenever Rust needs to sign a fresh IAM token with custom credentials.
+/// If root_certificates_provider is not null, it will be stored as a global reference and invoked
+/// periodically to supply the current custom TLS trust chain.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_glide_internal_GlideNativeBridge_createClient(
     mut env: JNIEnv,
@@ -1177,6 +1183,7 @@ pub extern "system" fn Java_glide_internal_GlideNativeBridge_createClient(
     connection_request_bytes: JByteArray,
     address_resolver: JObject,
     iam_credentials_provider: JObject,
+    root_certificates_provider: JObject,
 ) -> jlong {
     run_ffi(|| {
         // Convert Java byte array to Rust bytes
@@ -1254,6 +1261,37 @@ pub extern "system" fn Java_glide_internal_GlideNativeBridge_createClient(
                         "IAM credentials provider supplied but JVM is not initialised. \
                          Cannot inject custom credentials — refusing to fall back to the \
                          default AWS credential chain."
+                    );
+                    return Some(0);
+                }
+            }
+        }
+
+        // A dynamic root provider is deliberately independent of the protobuf: the callback is a
+        // binding-local Java object, while the interval is carried in the request so the core can
+        // enforce it even if a caller bypasses the Java builder.
+        if !root_certificates_provider.is_null() {
+            if connection_request.root_cert_reload_interval_seconds.is_none() {
+                log::error!(
+                    "Dynamic root certificates provider supplied without a reload interval. Refusing to create client."
+                );
+                return Some(0);
+            }
+            match jni_client::JVM.get().cloned() {
+                Some(jvm) => match JavaRootCertificatesCallback::new(
+                    &mut env,
+                    jvm,
+                    &root_certificates_provider,
+                ) {
+                    Some(callback) => {
+                        connection_request.root_certificates_provider =
+                            Some(make_root_certificates_provider_callback(callback));
+                    }
+                    None => return Some(0),
+                },
+                None => {
+                    log::error!(
+                        "Dynamic root certificates provider supplied but JVM is not initialised. Refusing to create client."
                     );
                     return Some(0);
                 }

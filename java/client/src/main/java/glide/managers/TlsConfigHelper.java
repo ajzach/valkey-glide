@@ -4,6 +4,7 @@ package glide.managers;
 import connection_request.ConnectionRequestOuterClass.ClientCertReloadConfig;
 import glide.api.models.configuration.AdvancedBaseClientConfiguration;
 import glide.api.models.configuration.BaseClientConfiguration;
+import glide.api.models.configuration.RootCertificatesProvider;
 import glide.api.models.configuration.TlsAdvancedConfiguration;
 import glide.api.models.exceptions.ConfigurationError;
 
@@ -40,6 +41,20 @@ public final class TlsConfigHelper {
             return null;
         }
         return tlsConfig.getRootCertificates();
+    }
+
+    /** Returns the dynamic root-certificates provider, or {@code null} when not configured. */
+    public static RootCertificatesProvider extractRootCertificatesProvider(
+            BaseClientConfiguration configuration) {
+        TlsAdvancedConfiguration tlsConfig = getTlsConfig(configuration);
+        return tlsConfig == null ? null : tlsConfig.getRootCertificatesProvider();
+    }
+
+    /** Returns the required dynamic root-certificates reload interval, or {@code null}. */
+    public static Integer extractRootCertificatesReloadIntervalSeconds(
+            BaseClientConfiguration configuration) {
+        TlsAdvancedConfiguration tlsConfig = getTlsConfig(configuration);
+        return tlsConfig == null ? null : tlsConfig.getRootCertificatesReloadIntervalSeconds();
     }
 
     /**

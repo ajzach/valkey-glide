@@ -244,6 +244,13 @@ public class GlideClusterClient extends BaseClient
      */
     public CompletableFuture<glide.api.models.scope.IsolatedScope> scopedConnection(
             @NonNull java.time.Duration timeout, String routingKey) {
+        if (connectionManager.hasDynamicRootCertificatesProvider()) {
+            CompletableFuture<glide.api.models.scope.IsolatedScope> f = new CompletableFuture<>();
+            f.completeExceptionally(
+                    new IllegalStateException(
+                            "scopedConnection is not supported with rootCertificatesProvider"));
+            return f;
+        }
         long clientId = connectionManager.getNativeClientHandle();
         byte[] connBytes = connectionManager.getConnectionRequestBytes();
         if (connBytes == null) {

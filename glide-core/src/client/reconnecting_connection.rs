@@ -573,6 +573,13 @@ impl ReconnectingConnection {
         });
     }
 
+    /// Drops the active transport and immediately starts the normal reconnection loop. Used after
+    /// a newly validated dynamic root trust chain is adopted so no established TLS session keeps
+    /// using the former trust store.
+    pub(super) fn force_reconnect(&self) {
+        self.reconnect(ReconnectReason::ConnectionDropped);
+    }
+
     pub fn is_connected(&self) -> bool {
         !matches!(
             *self.inner.state.lock().unwrap(),

@@ -486,6 +486,7 @@ impl PubSubTestSetup {
         let client_wrapper = ClientWrapper::Cluster {
             client: connection.clone(),
             _cert_material_manager: None,
+            _root_cert_material_manager: None,
         };
         let client_arc = Arc::new(TokioRwLock::new(client_wrapper));
 

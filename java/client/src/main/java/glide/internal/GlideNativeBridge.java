@@ -4,6 +4,7 @@ package glide.internal;
 import glide.api.logging.Logger;
 import glide.api.models.configuration.AddressResolver;
 import glide.api.models.configuration.GlideCredentialProvider;
+import glide.api.models.configuration.RootCertificatesProvider;
 import glide.ffi.resolvers.NativeUtils;
 
 /**
@@ -40,12 +41,15 @@ public class GlideNativeBridge {
      * @param connectionRequestBytes Protobuf-encoded ConnectionRequest
      * @param addressResolver The address resolver callback, or null if not needed
      * @param credentialsProvider Custom IAM credentials provider, or null to use default chain
+     * @param rootCertificatesProvider Dynamic custom root-certificates provider, or null for static
+     *     roots/platform trust
      * @return Native client handle, or 0 on failure
      */
     public static native long createClient(
             byte[] connectionRequestBytes,
             AddressResolver addressResolver,
-            GlideCredentialProvider credentialsProvider);
+            GlideCredentialProvider credentialsProvider,
+            RootCertificatesProvider rootCertificatesProvider);
 
     /** Execute a single command asynchronously, passing parameters directly via JNI. */
     public static native void executeCommandAsync(

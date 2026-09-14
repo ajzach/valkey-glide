@@ -53,6 +53,9 @@ public class ConnectionManager {
     /** Serialized protobuf ConnectionRequest bytes (stored for scope pool creation). */
     private volatile byte[] connectionRequestBytes;
 
+    /** Dynamic root providers cannot be safely transferred to scoped connections. */
+    private volatile boolean hasDynamicRootCertificatesProvider;
+
     /**
      * True when this manager wraps a pool-borrowed native client. The pool owns the native
      * connection's lifecycle, so close() here must not tear it down.
@@ -391,6 +394,20 @@ public class ConnectionManager {
                             requestBuilder.addRootCerts(com.google.protobuf.ByteString.copyFrom(rootCerts));
                         }
 
+                        glide.api.models.configuration.RootCertificatesProvider rootCertificatesProvider =
+                                TlsConfigHelper.extractRootCertificatesProvider(configuration);
+                        this.hasDynamicRootCertificatesProvider = rootCertificatesProvider != null;
+                        Integer rootCertificatesReloadIntervalSeconds =
+                                TlsConfigHelper.extractRootCertificatesReloadIntervalSeconds(configuration);
+                        if (rootCertificatesProvider != null) {
+                            if (!configuration.isUseTLS()) {
+                                throw new glide.api.models.exceptions.ConfigurationError(
+                                        "`rootCertificatesProvider` requires TLS to be enabled.");
+                            }
+                            requestBuilder.setRootCertReloadIntervalSeconds(
+                                    rootCertificatesReloadIntervalSeconds);
+                        }
+
                         // Set client certificate and key for mutual TLS (mTLS) if provided
                         byte[] clientCert = extractClientCertificate(configuration);
                         if (clientCert != null) {
@@ -564,7 +581,10 @@ public class ConnectionManager {
                         // if provided
                         this.nativeClientHandle =
                                 GlideNativeBridge.createClient(
-                                        requestBytes, addressResolver, iamCredentialsProvider);
+                                        requestBytes,
+                                        addressResolver,
+                                        iamCredentialsProvider,
+                                        rootCertificatesProvider);
 
                         if (nativeClientHandle == 0) {
                             throw new ClosingException("Failed to create client");
@@ -658,6 +678,11 @@ public class ConnectionManager {
     /** Get the serialized ConnectionRequest bytes for scope pool creation. */
     public byte[] getConnectionRequestBytes() {
         return connectionRequestBytes;
+    }
+
+    /** Whether this connection uses a dynamic root-certificates provider. */
+    public boolean hasDynamicRootCertificatesProvider() {
+        return hasDynamicRootCertificatesProvider;
     }
 
     /** Check if the connection is closed. */

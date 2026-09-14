@@ -237,6 +237,13 @@ public class GlideClient extends BaseClient
      */
     public CompletableFuture<IsolatedScope> scopedConnection(
             @NonNull java.time.Duration timeout, String routingKey) {
+        if (connectionManager.hasDynamicRootCertificatesProvider()) {
+            CompletableFuture<IsolatedScope> f = new CompletableFuture<>();
+            f.completeExceptionally(
+                    new IllegalStateException(
+                            "scopedConnection is not supported with rootCertificatesProvider"));
+            return f;
+        }
         long clientId = connectionManager.getNativeClientHandle();
         byte[] connBytes = connectionManager.getConnectionRequestBytes();
         if (connBytes == null) {

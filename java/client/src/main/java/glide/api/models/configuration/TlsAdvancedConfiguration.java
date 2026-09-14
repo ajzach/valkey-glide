@@ -36,6 +36,8 @@ import lombok.Getter;
  *       mTLS reloading at the core's default cadence (see {@link #certReloadIntervalSeconds}).
  *   <li>{@link TlsAdvancedConfigurationBuilder#useMutualTlsWithReload(String, String, int)} -
  *       path-based mTLS reloading every {@code intervalSecs} seconds.
+ *   <li>{@link TlsAdvancedConfigurationBuilder#useRootCertificatesProvider(
+ *       RootCertificatesProvider, int)} - dynamically reloads the custom server trust chain.
  * </ul>
  *
  * <p>Using either {@code useMutualTlsWithReload} overload enables reloading; the explicit interval
@@ -84,6 +86,16 @@ public class TlsAdvancedConfiguration {
      * <p>The certificate data should be in PEM format as a byte array.
      */
     @Builder.Default private final byte[] rootCertificates = null;
+
+    /**
+     * Dynamic source for the complete custom TLS trust chain. This is an alternative to {@link
+     * #rootCertificates}; it is deliberately incompatible with mTLS and insecure TLS in this first
+     * version so that a rotated trust store always has one unambiguous owner.
+     */
+    private final RootCertificatesProvider rootCertificatesProvider;
+
+    /** Positive polling interval in seconds for {@link #rootCertificatesProvider}. */
+    private final Integer rootCertificatesReloadIntervalSeconds;
 
     /**
      * PEM-encoded client certificate for in-memory mTLS, set via {@link
@@ -135,8 +147,9 @@ public class TlsAdvancedConfiguration {
      *       mTLS.
      * </ul>
      *
-     * <p>Root/CA certificate reload is out of scope; only the client certificate and key are
-     * reloaded.
+     * <p>This mTLS option reloads only the client certificate and key. To rotate server trust roots,
+     * use {@link TlsAdvancedConfigurationBuilder#useRootCertificatesProvider(
+     * RootCertificatesProvider, int)} instead.
      */
     private final Integer certReloadIntervalSeconds;
 
@@ -149,6 +162,8 @@ public class TlsAdvancedConfiguration {
     TlsAdvancedConfiguration(
             boolean useInsecureTLS,
             byte[] rootCertificates,
+            RootCertificatesProvider rootCertificatesProvider,
+            Integer rootCertificatesReloadIntervalSeconds,
             byte[] clientCertificate,
             byte[] clientKey,
             String clientCertPath,
@@ -156,6 +171,8 @@ public class TlsAdvancedConfiguration {
             Integer certReloadIntervalSeconds) {
         this.useInsecureTLS = useInsecureTLS;
         this.rootCertificates = rootCertificates;
+        this.rootCertificatesProvider = rootCertificatesProvider;
+        this.rootCertificatesReloadIntervalSeconds = rootCertificatesReloadIntervalSeconds;
         this.clientCertificate = clientCertificate;
         this.clientKey = clientKey;
         this.clientCertPath = clientCertPath;
@@ -174,10 +191,35 @@ public class TlsAdvancedConfiguration {
      * @throws ConfigurationError if any invariant is violated.
      */
     private void validate() {
+        boolean hasRootCertificatesProvider = rootCertificatesProvider != null;
+        boolean hasStaticRootCertificates = rootCertificates != null;
         boolean hasCert = clientCertificate != null;
         boolean hasKey = clientKey != null;
         boolean hasCertPath = clientCertPath != null;
         boolean hasKeyPath = clientKeyPath != null;
+
+        if (hasRootCertificatesProvider && hasStaticRootCertificates) {
+            throw new ConfigurationError(
+                    "`rootCertificates` and `rootCertificatesProvider` cannot both be provided; use one source of trust roots.");
+        }
+        if (!hasRootCertificatesProvider && rootCertificatesReloadIntervalSeconds != null) {
+            throw new ConfigurationError(
+                    "`rootCertificatesReloadIntervalSeconds` may only be set with `rootCertificatesProvider`.");
+        }
+        if (hasRootCertificatesProvider
+                && (rootCertificatesReloadIntervalSeconds == null
+                        || rootCertificatesReloadIntervalSeconds <= 0)) {
+            throw new ConfigurationError(
+                    "`rootCertificatesReloadIntervalSeconds` must be positive when using `rootCertificatesProvider`.");
+        }
+        if (hasRootCertificatesProvider && useInsecureTLS) {
+            throw new ConfigurationError(
+                    "`rootCertificatesProvider` cannot be combined with `useInsecureTLS`; dynamic roots require certificate verification.");
+        }
+        if (hasRootCertificatesProvider && (hasCert || hasKey || hasCertPath || hasKeyPath)) {
+            throw new ConfigurationError(
+                    "`rootCertificatesProvider` currently supports server TLS only and cannot be combined with mTLS configuration.");
+        }
 
         if (hasCertPath && !hasKeyPath) {
             throw new ConfigurationError(
@@ -292,6 +334,25 @@ public class TlsAdvancedConfiguration {
     public static class TlsAdvancedConfigurationBuilder {
 
         /**
+         * Uses a dynamic provider for the complete custom server trust chain.
+         *
+         * <p>The provider is invoked before the first TLS handshake and then every {@code
+         * intervalSecs} seconds. A newly validated bundle forces reconnection so all replacement
+         * sessions use the new trust store. If retrieval or validation fails after startup, GLIDE
+         * keeps the last-known-good bundle and does not fall back to platform roots.
+         *
+         * @param provider thread-safe source of a complete PEM trust bundle
+         * @param intervalSecs positive polling interval in seconds
+         * @return this builder instance
+         */
+        public TlsAdvancedConfigurationBuilder useRootCertificatesProvider(
+                RootCertificatesProvider provider, int intervalSecs) {
+            this.rootCertificatesProvider = provider;
+            this.rootCertificatesReloadIntervalSeconds = intervalSecs;
+            return this;
+        }
+
+        /**
          * Enables mutual TLS (mTLS) using in-memory client certificate and key bytes, loaded once
          * (static, no reload). To load static material from files, pass the loader results here:
          *
@@ -404,6 +465,18 @@ public class TlsAdvancedConfiguration {
         private TlsAdvancedConfigurationBuilder certReloadIntervalSeconds(
                 Integer certReloadIntervalSeconds) {
             this.certReloadIntervalSeconds = certReloadIntervalSeconds;
+            return this;
+        }
+
+        private TlsAdvancedConfigurationBuilder rootCertificatesProvider(
+                RootCertificatesProvider rootCertificatesProvider) {
+            this.rootCertificatesProvider = rootCertificatesProvider;
+            return this;
+        }
+
+        private TlsAdvancedConfigurationBuilder rootCertificatesReloadIntervalSeconds(
+                Integer rootCertificatesReloadIntervalSeconds) {
+            this.rootCertificatesReloadIntervalSeconds = rootCertificatesReloadIntervalSeconds;
             return this;
         }
     }

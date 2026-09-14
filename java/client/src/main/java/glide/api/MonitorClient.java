@@ -173,6 +173,11 @@ public class MonitorClient implements AutoCloseable {
             builder.setTlsMode(TlsMode.NoTls);
         }
 
+        if (TlsConfigHelper.extractRootCertificatesProvider(config) != null) {
+            throw new glide.api.models.exceptions.ConfigurationError(
+                    "MonitorClient does not support `rootCertificatesProvider`; use static rootCertificates instead.");
+        }
+
         byte[] rootCerts = TlsConfigHelper.extractRootCertificates(config);
         if (rootCerts != null) {
             builder.addRootCerts(ByteString.copyFrom(rootCerts));

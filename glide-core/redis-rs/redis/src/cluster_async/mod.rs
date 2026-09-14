@@ -470,6 +470,35 @@ where
             .await
     }
 
+    /// Rebuilds every cluster node connection using the freshest dynamic TLS parameters.
+    ///
+    /// This is intentionally disruptive: callers use it only after a custom trust chain has been
+    /// validated and replaced, ensuring no already-established TLS session survives that update.
+    #[doc(hidden)]
+    pub fn force_tls_reconnect(&self) {
+        let inner = self.inner_core.clone();
+        tokio::spawn(async move {
+            ClusterConnInner::refresh_cert_params_in_cluster_params(&inner).await;
+            let addresses: HashSet<String> = inner
+                .conn_lock
+                .read()
+                .all_node_connections()
+                .map(|(address, _)| address.to_string())
+                .collect();
+            if addresses.is_empty() {
+                ClusterConnInner::reconnect_to_initial_nodes(inner).await;
+            } else {
+                ClusterConnInner::trigger_refresh_connection_tasks(
+                    inner,
+                    addresses,
+                    RefreshConnectionType::AllConnections,
+                    false,
+                )
+                .await;
+            }
+        });
+    }
+
     /// Get the username used to authenticate with all cluster servers
     pub async fn get_username(&mut self) -> RedisResult<Value> {
         self.route_operation_request(Operation::GetUsername).await

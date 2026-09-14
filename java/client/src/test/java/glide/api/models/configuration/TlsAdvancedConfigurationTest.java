@@ -317,7 +317,9 @@ public class TlsAdvancedConfigurationTest {
         ConfigurationError error =
                 assertThrows(
                         ConfigurationError.class,
-                        () -> new TlsAdvancedConfiguration(false, null, null, null, null, null, 60));
+                        () ->
+                                new TlsAdvancedConfiguration(
+                                        false, null, null, null, null, null, null, null, 60));
         assertTrue(
                 error
                         .getMessage()
@@ -344,7 +346,9 @@ public class TlsAdvancedConfigurationTest {
         ConfigurationError error =
                 assertThrows(
                         ConfigurationError.class,
-                        () -> new TlsAdvancedConfiguration(false, null, cert, key, null, null, 60));
+                        () ->
+                                new TlsAdvancedConfiguration(
+                                        false, null, null, null, cert, key, null, null, 60));
         assertTrue(
                 error
                         .getMessage()
@@ -363,7 +367,67 @@ public class TlsAdvancedConfigurationTest {
                         ConfigurationError.class,
                         () ->
                                 new TlsAdvancedConfiguration(
-                                        false, null, cert, key, "/certs/client.pem", "/certs/client.key", null));
+                                        false,
+                                        null,
+                                        null,
+                                        null,
+                                        cert,
+                                        key,
+                                        "/certs/client.pem",
+                                        "/certs/client.key",
+                                        null));
         assertTrue(error.getMessage().contains("cannot both be provided"));
+    }
+
+    @Test
+    void testUseRootCertificatesProvider() {
+        RootCertificatesProvider provider = () -> "-----BEGIN CERTIFICATE-----".getBytes(StandardCharsets.UTF_8);
+
+        TlsAdvancedConfiguration config =
+                TlsAdvancedConfiguration.builder().useRootCertificatesProvider(provider, 60).build();
+
+        assertSame(provider, config.getRootCertificatesProvider());
+        assertEquals(60, config.getRootCertificatesReloadIntervalSeconds());
+        assertNull(config.getRootCertificates());
+    }
+
+    @Test
+    void testRootCertificatesProviderRequiresPositiveInterval() {
+        RootCertificatesProvider provider = () -> new byte[] {1};
+
+        ConfigurationError error =
+                assertThrows(
+                        ConfigurationError.class,
+                        () ->
+                                TlsAdvancedConfiguration.builder()
+                                        .useRootCertificatesProvider(provider, 0)
+                                        .build());
+
+        assertTrue(error.getMessage().contains("`rootCertificatesReloadIntervalSeconds` must be positive"));
+    }
+
+    @Test
+    void testRootCertificatesProviderRejectsStaticRootsAndMutualTls() {
+        RootCertificatesProvider provider = () -> new byte[] {1};
+
+        ConfigurationError staticRootsError =
+                assertThrows(
+                        ConfigurationError.class,
+                        () ->
+                                TlsAdvancedConfiguration.builder()
+                                        .rootCertificates(new byte[] {1})
+                                        .useRootCertificatesProvider(provider, 60)
+                                        .build());
+        assertTrue(staticRootsError.getMessage().contains("cannot both be provided"));
+
+        ConfigurationError mtlsError =
+                assertThrows(
+                        ConfigurationError.class,
+                        () ->
+                                TlsAdvancedConfiguration.builder()
+                                        .useMutualTls(new byte[] {1}, new byte[] {2})
+                                        .useRootCertificatesProvider(provider, 60)
+                                        .build());
+        assertTrue(mtlsError.getMessage().contains("cannot be combined with mTLS"));
     }
 }

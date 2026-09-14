@@ -42,6 +42,11 @@ pub struct ConnectionRequest {
     pub lazy_connect: bool,
     pub refresh_topology_from_initial_nodes: bool,
     pub root_certs: Vec<Vec<u8>>,
+    /// Binding-provided dynamic custom root certificate source. The provider object itself is not
+    /// serialized in protobuf; language bindings attach it after decoding the request.
+    pub root_certificates_provider: Option<crate::tls_reload::RootCertificatesProvider>,
+    /// Required polling interval for `root_certificates_provider`.
+    pub root_cert_reload_interval_seconds: Option<u32>,
     pub client_cert: Vec<u8>,
     pub client_key: Vec<u8>,
     /// Path to the mTLS client certificate file (PEM). When set together with
@@ -444,6 +449,9 @@ impl From<protobuf::ConnectionRequest> for ConnectionRequest {
             .into_iter()
             .map(|cert| cert.to_vec())
             .collect();
+        let root_cert_reload_interval_seconds = value
+            .root_cert_reload_interval_seconds
+            .filter(|&seconds| seconds != 0);
 
         let client_cert = value.client_cert.to_vec();
         let client_key = value.client_key.to_vec();
@@ -553,6 +561,8 @@ impl From<protobuf::ConnectionRequest> for ConnectionRequest {
             lazy_connect,
             refresh_topology_from_initial_nodes,
             root_certs,
+            root_certificates_provider: None,
+            root_cert_reload_interval_seconds,
             client_side_cache,
             client_cert,
             client_key,

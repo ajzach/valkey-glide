@@ -14,6 +14,7 @@ import glide.api.models.exceptions.ClosingException;
 import glide.ffi.resolvers.GlidePoolResolver;
 import glide.internal.ClientLibraryNameResolver;
 import glide.internal.GlideNativeBridge;
+import glide.managers.TlsConfigHelper;
 import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
@@ -77,6 +78,10 @@ public class ClientPool implements AutoCloseable {
             throw new IllegalArgumentException(
                     "Pool clients cannot have pubsub subscriptions configured. "
                             + "Use the main client's pubsub API instead.");
+        }
+        if (TlsConfigHelper.extractRootCertificatesProvider(config.getClientConfig()) != null) {
+            throw new IllegalArgumentException(
+                    "ClientPool does not support rootCertificatesProvider");
         }
 
         byte[] connectionRequestBytes = serializeConnectionRequest(config.getClientConfig());

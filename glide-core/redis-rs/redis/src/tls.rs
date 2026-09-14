@@ -101,6 +101,7 @@ pub fn retrieve_tls_certificates(certificates: TlsCertificates) -> RedisResult<T
         // Parse root certificates using rustls-pki-types v1.9.0+ API
         let certs = CertificateDer::pem_slice_iter(&root_cert);
         let mut root_cert_store = RootCertStore::empty();
+        let mut parsed_certificates = 0usize;
         for result in certs {
             let cert = result.map_err(|e| {
                 Error::new(
@@ -113,6 +114,14 @@ pub fn retrieve_tls_certificates(certificates: TlsCertificates) -> RedisResult<T
                     Error::new(IOErrorKind::Other, "Unable to parse TLS trust anchors").into(),
                 );
             }
+            parsed_certificates += 1;
+        }
+        if parsed_certificates == 0 {
+            return Err(Error::new(
+                IOErrorKind::Other,
+                "No TLS trust anchors were found in the root certificate bundle",
+            )
+            .into());
         }
 
         Some(root_cert_store)

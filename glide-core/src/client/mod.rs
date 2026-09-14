@@ -488,6 +488,9 @@ pub enum ClientWrapper {
         /// lifetime; the [`crate::tls_reload::CertReloadHandle`] shared with the reconnect loop keeps
         /// working as long as this manager is alive.
         _cert_material_manager: Option<Arc<crate::tls_reload::CertReloadManager>>,
+        /// Owns dynamic custom-root polling and signals the cluster to replace all TLS sessions
+        /// when a new trust chain is adopted.
+        _root_cert_material_manager: Option<Arc<crate::tls_reload::RootCertReloadManager>>,
     },
     Lazy(Box<LazyClient>),
 }
@@ -1168,16 +1171,18 @@ impl Client {
             // Create the appropriate client based on configuration
             let real_client = if config.cluster_mode_enabled {
                 // Create cluster client
-                let (client, cert_material_manager) = create_cluster_client(
-                    config,
-                    push_sender,
-                    iam_manager_ref,
-                    self.pubsub_synchronizer.clone(),
-                )
-                .await?;
+                let (client, cert_material_manager, root_cert_material_manager) =
+                    create_cluster_client(
+                        config,
+                        push_sender,
+                        iam_manager_ref,
+                        self.pubsub_synchronizer.clone(),
+                    )
+                    .await?;
                 ClientWrapper::Cluster {
                     client,
                     _cert_material_manager: cert_material_manager,
+                    _root_cert_material_manager: root_cert_material_manager,
                 }
             } else {
                 // Create standalone client
@@ -2441,9 +2446,8 @@ pub(crate) fn to_duration(time_in_millis: Option<u32>, default: Duration) -> Dur
 /// rejecting any empty entry. Returns `Ok(None)` when no root certs are provided.
 ///
 /// Shared by the standalone and cluster connection paths so the combining rule and
-/// the empty-entry validation live in one place. Callers run this *before* building
-/// the cert-reload manager, so the manager never sees unvalidated root material.
-/// (Root/CA reload itself is out of scope; see #6529.)
+/// the empty-entry validation live in one place. This helper is for static roots;
+/// dynamic root certificates are supplied and validated by `RootCertReloadManager`.
 pub(super) fn combine_root_certs(root_certs: &[Vec<u8>]) -> RedisResult<Option<Vec<u8>>> {
     if root_certs.is_empty() {
         return Ok(None);
@@ -2494,6 +2498,58 @@ pub(super) fn validate_client_cert_config(
     Ok(())
 }
 
+/// Validates the binding-provided dynamic custom-root configuration. A provider supplies a complete
+/// replacement trust store, so it cannot coexist with static roots or any mTLS material in this
+/// first version. This keeps the source of every active TLS parameter unambiguous.
+pub(super) fn validate_root_certificates_provider_config(
+    request: &ConnectionRequest,
+) -> RedisResult<()> {
+    let has_provider = request.root_certificates_provider.is_some();
+    let has_static_roots = !request.root_certs.is_empty();
+    let has_client_material = !request.client_cert.is_empty()
+        || !request.client_key.is_empty()
+        || request.client_cert_path.is_some()
+        || request.client_key_path.is_some();
+
+    if !has_provider {
+        if request.root_cert_reload_interval_seconds.is_some() {
+            return Err(RedisError::from((
+                ErrorKind::InvalidClientConfig,
+                "root certificate reload interval requires a root certificates provider",
+            )));
+        }
+        return Ok(());
+    }
+    if request
+        .root_cert_reload_interval_seconds
+        .is_none_or(|seconds| seconds == 0)
+    {
+        return Err(RedisError::from((
+            ErrorKind::InvalidClientConfig,
+            "root certificates provider requires a positive reload interval",
+        )));
+    }
+    if has_static_roots {
+        return Err(RedisError::from((
+            ErrorKind::InvalidClientConfig,
+            "root certificates provider cannot be combined with static root certificates",
+        )));
+    }
+    if has_client_material {
+        return Err(RedisError::from((
+            ErrorKind::InvalidClientConfig,
+            "root certificates provider cannot be combined with mTLS configuration",
+        )));
+    }
+    if request.tls_mode.unwrap_or_default() != TlsMode::SecureTls {
+        return Err(RedisError::from((
+            ErrorKind::InvalidClientConfig,
+            "root certificates provider requires secure TLS certificate verification",
+        )));
+    }
+    Ok(())
+}
+
 /// Build a [`crate::tls_reload::CertReloadManager`] for a cluster client when
 /// path-based mTLS is configured, starting its background reload task if reload is
 /// enabled. Returns `Ok(None)` when no cert paths are configured. `root_cert` is the
@@ -2537,6 +2593,30 @@ async fn build_cluster_cert_material_manager(
     Ok(Some(Arc::new(manager)))
 }
 
+async fn build_cluster_root_cert_material_manager(
+    request: &ConnectionRequest,
+) -> RedisResult<Option<Arc<crate::tls_reload::RootCertReloadManager>>> {
+    let Some(provider) = request.root_certificates_provider.clone() else {
+        return Ok(None);
+    };
+    let interval_seconds = request.root_cert_reload_interval_seconds.ok_or_else(|| {
+        RedisError::from((
+            ErrorKind::InvalidClientConfig,
+            "root certificates provider requires a positive reload interval",
+        ))
+    })?;
+    let mut manager = crate::tls_reload::RootCertReloadManager::new(provider, interval_seconds)
+        .await
+        .map_err(|_| {
+            RedisError::from((
+                ErrorKind::InvalidClientConfig,
+                "initial dynamic root certificate load failed",
+            ))
+        })?;
+    manager.start_reload_task();
+    Ok(Some(Arc::new(manager)))
+}
+
 #[allow(clippy::type_complexity)]
 async fn create_cluster_client(
     request: ConnectionRequest,
@@ -2546,6 +2626,7 @@ async fn create_cluster_client(
 ) -> RedisResult<(
     redis::cluster_async::ClusterConnection,
     Option<Arc<crate::tls_reload::CertReloadManager>>,
+    Option<Arc<crate::tls_reload::RootCertReloadManager>>,
 )> {
     let tls_mode = request.tls_mode.unwrap_or_default();
 
@@ -2556,11 +2637,14 @@ async fn create_cluster_client(
     let has_client_key = !request.client_key.is_empty();
     let has_cert_path = request.client_cert_path.is_some();
     let has_key_path = request.client_key_path.is_some();
+    validate_root_certificates_provider_config(&request)?;
     validate_client_cert_config(has_client_cert, has_client_key, has_cert_path, has_key_path)?;
 
     // Combine + validate the root certs first (fail fast on an empty entry) so the
     // cert-reload manager, built next, never sees unvalidated root material.
     let root_cert_bytes = combine_root_certs(&request.root_certs)?;
+
+    let root_cert_material_manager = build_cluster_root_cert_material_manager(&request).await?;
 
     // Build the certificate reload manager when path-based mTLS is configured; it
     // validates the initial material and, if reload is enabled, drives the
@@ -2570,6 +2654,7 @@ async fn create_cluster_client(
     let cert_material_manager =
         build_cluster_cert_material_manager(&request, root_cert_bytes.clone()).await?;
     let cert_material_handle = cert_material_manager.as_ref().map(|m| m.get_handle());
+    let root_cert_material_handle = root_cert_material_manager.as_ref().map(|m| m.get_handle());
 
     // `tls_params` seeds the initial nodes and (when present) is handed to the
     // cluster builder directly. `tls_certificates` carries the raw byte material for
@@ -2578,7 +2663,15 @@ async fn create_cluster_client(
     // the manager's already-validated params instead, so the builder does not
     // re-read/re-parse the files (which would skip the key-match check and could
     // observe a torn rotation).
-    let (tls_params, tls_certificates) = if let Some(manager) = &cert_material_manager {
+    let (tls_params, tls_certificates) = if let Some(manager) = &root_cert_material_manager {
+        if tls_mode != TlsMode::SecureTls {
+            return Err(RedisError::from((
+                ErrorKind::InvalidClientConfig,
+                "Dynamic root certificates require secure TLS certificate verification",
+            )));
+        }
+        (Some(manager.get_params().await), None)
+    } else if let Some(manager) = &cert_material_manager {
         if tls_mode == TlsMode::NoTls {
             return Err(RedisError::from((
                 ErrorKind::InvalidClientConfig,
@@ -2717,7 +2810,9 @@ async fn create_cluster_client(
         .map(|manager| Arc::new(manager.get_token_handle()) as Arc<dyn redis::IAMTokenProvider>);
 
     let cert_params_provider: Option<Arc<dyn redis::CertParamsProvider>> =
-        cert_material_handle.map(|handle| Arc::new(handle) as Arc<dyn redis::CertParamsProvider>);
+        root_cert_material_handle
+            .or(cert_material_handle)
+            .map(|handle| Arc::new(handle) as Arc<dyn redis::CertParamsProvider>);
 
     let mut con = client
         .get_async_connection(
@@ -2773,7 +2868,17 @@ async fn create_cluster_client(
             }
         }
     }
-    Ok((con, cert_material_manager))
+    if let Some(manager) = &root_cert_material_manager {
+        let update_handle = manager.get_update_handle();
+        let cluster_connection = con.clone();
+        tokio::spawn(async move {
+            while update_handle.wait_for_update().await {
+                cluster_connection.force_tls_reconnect();
+            }
+        });
+    }
+
+    Ok((con, cert_material_manager, root_cert_material_manager))
 }
 
 #[derive(thiserror::Error)]
@@ -3141,17 +3246,19 @@ impl Client {
                     push_sender,
                 }))
             } else if request.cluster_mode_enabled {
-                let (client, cert_material_manager) = create_cluster_client(
-                    request,
-                    push_sender,
-                    iam_token_manager.as_ref(),
-                    pubsub_synchronizer.clone(),
-                )
-                .await
-                .map_err(ConnectionError::Cluster)?;
+                let (client, cert_material_manager, root_cert_material_manager) =
+                    create_cluster_client(
+                        request,
+                        push_sender,
+                        iam_token_manager.as_ref(),
+                        pubsub_synchronizer.clone(),
+                    )
+                    .await
+                    .map_err(ConnectionError::Cluster)?;
                 ClientWrapper::Cluster {
                     client,
                     _cert_material_manager: cert_material_manager,
+                    _root_cert_material_manager: root_cert_material_manager,
                 }
             } else {
                 ClientWrapper::Standalone(

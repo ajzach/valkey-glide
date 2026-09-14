@@ -379,27 +379,6 @@ public class GlideCoreClient implements AutoCloseable {
         return future;
     }
 
-    /** Execute a single command asynchronously via JNI. */
-    public CompletableFuture<Object> executeCommandAsync(
-            int requestType,
-            byte[][] args,
-            boolean hasRoute,
-            int routeType,
-            String routeParam,
-            boolean expectUtf8Response,
-            long timeoutMs,
-            long spanPtr) {
-        return executeCommandAsync(
-                requestType,
-                args,
-                hasRoute,
-                routeType,
-                routeParam,
-                expectUtf8Response,
-                timeoutMs,
-                spanPtr);
-    }
-
     /** Execute UTF-8 MGET through a fixed synchronous decoder. */
     public CompletableFuture<String[]> executeMgetStringCommandAsync(
             byte[][] args, byte[] packedArgs, long timeoutMs, long spanPtr) {
@@ -658,7 +637,8 @@ public class GlideCoreClient implements AutoCloseable {
         }
     }
 
-    private CompletableFuture<Object> executeCommandAsync(
+    /** Execute a single command asynchronously via JNI. */
+    public CompletableFuture<Object> executeCommandAsync(
             int requestType,
             byte[][] args,
             boolean hasRoute,

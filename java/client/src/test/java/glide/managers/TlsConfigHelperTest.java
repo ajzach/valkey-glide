@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.*;
 import connection_request.ConnectionRequestOuterClass.ClientCertReloadConfig;
 import glide.api.models.configuration.AdvancedGlideClientConfiguration;
 import glide.api.models.configuration.GlideClientConfiguration;
+import glide.api.models.configuration.RootCertificatesProvider;
 import glide.api.models.configuration.TlsAdvancedConfiguration;
 import java.nio.charset.StandardCharsets;
 import org.junit.jupiter.api.Test;
@@ -46,6 +47,19 @@ public class TlsConfigHelperTest {
 
         assertNull(TlsConfigHelper.extractClientCertificate(configuration));
         assertNull(TlsConfigHelper.extractClientKey(configuration));
+    }
+
+    @Test
+    void extractRootCertificatesProviderReturnsConfiguredValues() {
+        RootCertificatesProvider provider = () -> CERT;
+        GlideClientConfiguration configuration =
+                configWithTls(
+                        TlsAdvancedConfiguration.builder()
+                                .useRootCertificatesProvider(provider, 90)
+                                .build());
+
+        assertSame(provider, TlsConfigHelper.extractRootCertificatesProvider(configuration));
+        assertEquals(90, TlsConfigHelper.extractRootCertificatesReloadIntervalSeconds(configuration));
     }
 
     @Test
